@@ -26,7 +26,7 @@ const HELP: &str = "用法：
   ssfp ctl dev os <设备> <模板>
   ssfp ctl dev del|enable|disable|rotate|link <设备>
   ssfp ctl dev rename <设备> <新名称>
-  ssfp ctl dev test <设备> [主机:端口]         以该设备身份经本机 ssfp 访问目标（默认 example.com:80），检查链路与 SYN 改写
+  ssfp ctl dev test <设备> [主机:端口]         以该设备身份经本机 ssfp 访问目标（默认 1.1.1.1:80），检查链路与 SYN 改写
   ssfp ctl sub <用户> [--dialer 节点名]       打印 Clash 订阅内容与订阅地址
 <用户> 写名称或编号；<设备> 写编号或 用户/设备名。默认配置 /etc/ssfp/config.toml，用 -c 指定。";
 
@@ -160,7 +160,12 @@ async fn self_test(cfg: &Config, c: &Client, dev_id: u64, target: &str) -> anyho
     };
     let line = String::from_utf8_lossy(&got).lines().next().unwrap_or("").to_string();
     anyhow::ensure!(!line.is_empty(), "FAIL 目标 {target} 没有返回数据{}", reason());
-    println!("OK   以设备 {}（模板 {}）经 ssfp 访问 {target}：{line}（{} ms）", dev.name, dev.template, started.elapsed().as_millis());
+    println!(
+        "OK   以设备 {}（模板 {}）经 ssfp 访问 {target}：{line}（{} ms；收到 HTTP 响应即链路正常，状态码不重要）",
+        dev.name,
+        dev.template,
+        started.elapsed().as_millis()
+    );
 
     if after["ebpf_iface"].is_null() {
         println!("WARN eBPF 未挂载，SYN 选项布局没有改写（ssfp check 查看原因）");
@@ -174,7 +179,7 @@ async fn self_test(cfg: &Config, c: &Client, dev_id: u64, target: &str) -> anyho
     } else if expect_rewrite && rw == 0 {
         println!("FAIL 模板 {} 的 SYN 应被改写，但 eBPF 计数没有变化：出站可能没走 {}", dev.template, after["ebpf_iface"]);
     } else {
-        println!("OK   eBPF：本次改写 {rw} 个 SYN，原样放行 {un} 个（linux / none 模板不需要改写）");
+        println!("OK   eBPF：本次改写 {rw} 个 SYN，原样放行 {un} 个");
     }
     Ok(())
 }
@@ -224,7 +229,12 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     match a.as_slice() {
         ["url"] => {
             println!("http://{addr}/#t={token}");
-            println!("（只在内网 / VPN 里能打开；令牌等同管理员密码）");
+            if !addr.ip().is_loopback() {
+                println!("经 SSH 转发（ssh -L {p}:{addr} 服务器）时打开：http://127.0.0.1:{p}/#t={token}", p = addr.port());
+            } else {
+                println!("在本机电脑上先运行 ssh -L {p}:{addr} 服务器，再用浏览器打开上面的地址", p = addr.port());
+            }
+            println!("（令牌等同管理员密码，不要外传）");
         }
         ["list"] => {
             for u in c.users().await? {
@@ -294,7 +304,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         }
         ["dev", "test", d, rest @ ..] => {
             let (_, dv) = c.device(d).await?;
-            let target = rest.first().copied().unwrap_or("example.com:80");
+            let target = rest.first().copied().unwrap_or("1.1.1.1:80");
             self_test(&cfg, &c, dv["id"].as_u64().unwrap_or(0), target).await?;
         }
         ["dev", "rename", d, name] => {

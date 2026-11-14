@@ -160,15 +160,16 @@ sudo ssfp ctl dev test <USER>/<DEVICE>                # once per device
 | `WARN net.ipv4.tcp_rmem 上限 …` | The Windows/Android window scale will be too small. Run `sudo sysctl -p /etc/sysctl.d/99-ssfp.conf`, then re-check. |
 | `WARN 还没有设备` | Go back to step 6. |
 
-**`ssfp ctl dev test`** connects to the local ssfp *as that device* and sends `HEAD /` to `example.com:80`. Expected:
+**`ssfp ctl dev test`** connects to the local ssfp *as that device* and sends `HEAD /` to `1.1.1.1:80`. Expected:
 
 ```
-OK   以设备 <DEVICE>（模板 windows）经 ssfp 访问 example.com:80：HTTP/1.1 200 OK（123 ms）
-OK   eBPF：本次改写 1 个 SYN，原样放行 0 个（linux / none 模板不需要改写）
+OK   以设备 <DEVICE>（模板 windows）经 ssfp 访问 1.1.1.1:80：HTTP/1.1 301 Moved Permanently（23 ms；收到 HTTP 响应即链路正常，状态码不重要）
+OK   eBPF：本次改写 1 个 SYN，原样放行 0 个
 ```
 
-- For `windows` / `apple` / `android`, "改写" (rewritten) must be ≥ 1. For `linux` / `none` / `auto`, 0 rewrites is normal.
-- If you see `目标没有可用的公网地址` (the target has no public address), the server's DNS returns private or fake-ip answers. Retest with an IP: `ssfp ctl dev test <USER>/<DEVICE> 1.1.1.1:80` (any HTTP status line counts as success), and mention the DNS issue to the user.
+- Any HTTP status line (200, 301, 403 …) means the path works.
+- For `windows` / `apple` / `android`, "改写" (rewritten) must be ≥ 1, otherwise the command prints a FAIL line. For `linux` / `none` / `auto`, any count is fine.
+- If 1.1.1.1 is unreachable from the server, pass another HTTP target: `ssfp ctl dev test <USER>/<DEVICE> example.com:80`. If that prints `目标没有可用的公网地址` (the target has no public address), the server's DNS returns private or fake-ip answers. Mention the DNS issue to the user.
 
 Optional external check: if the user runs an [fpprobe](https://github.com/aidever/fpprobe) instance, they can open it through each device's node and compare the p0f verdict with the device's OS.
 

@@ -150,7 +150,7 @@ ssh -L 43480:127.0.0.1:43480 root@203.0.113.10
 | `public_host … 不是公网地址` | 云主机 NAT。在配置里填 `public_host = "公网IP或域名"`，然后重启服务 |
 | `tcp_rmem 上限 … < 25165824` | 内核参数没生效：`sysctl -p /etc/sysctl.d/99-ssfp.conf`。不处理的话 Windows 和 Android 的 wscale 会偏小 |
 | 客户端连不上 | 检查云安全组和系统防火墙是否放行了 TCP + UDP 端口；`ssfp ctl dev test` 能通说明服务本身没问题 |
-| `dev test` 报“目标没有可用的公网地址” | 服务器的 DNS 返回了内网或 fake-ip 地址，换成 IP 测试：`ssfp ctl dev test 我/台式机 1.1.1.1:80` |
+| `dev test` 用域名做目标时报“目标没有可用的公网地址” | 服务器的 DNS 返回了内网或 fake-ip 地址（默认目标是 `1.1.1.1:80`，不受影响） |
 | SYN 应被改写但 eBPF 计数不变 | 出站流量走的不是挂 eBPF 的网卡（策略路由、WireGuard 出口等），在配置里写明 `syn_rewrite_iface` |
 
 ## 工作原理

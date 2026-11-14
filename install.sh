@@ -157,6 +157,10 @@ elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1;
   fi
 fi
 
+CONSOLE=$(sed -n 's/^console_listen *= *"\([^"]*\)".*/\1/p' "$CONF" | head -1)
+CONSOLE=${CONSOLE:-127.0.0.1:43480}
+CPORT=${CONSOLE##*:}
+
 echo
 if [ "$START" = 1 ]; then
   "$BIN" check -c "$CONF" || true
@@ -169,5 +173,5 @@ cat <<EOF
   ssfp ctl dev add 我 电脑 windows        # 模板：windows apple android linux auto
   ssfp ctl dev test 我/电脑               # 自测链路与 SYN 改写
   ssfp ctl sub 我                         # Clash 订阅内容；单台设备链接：ssfp ctl dev link 我/电脑
-看板：ssh -L 43480:127.0.0.1:43480 <服务器>，然后打开 ssfp ctl url 输出的地址
+看板（$CONSOLE）：ssh -L $CPORT:$CONSOLE <服务器>，然后在本机浏览器打开 ssfp ctl url 输出的地址
 EOF
