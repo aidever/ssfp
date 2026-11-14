@@ -1,0 +1,24 @@
+[Unit]
+Description=ssfp Shadowsocks 2022 server (egress fingerprint follows client OS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ssfp /etc/ssfp/config.toml
+Restart=on-failure
+RestartSec=2
+LogsDirectory=ssfp
+StateDirectory=ssfp
+StateDirectoryMode=0700
+# SO_MARK / clsact / 加载 eBPF
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_NET_BIND_SERVICE
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+[package]
+name = "ssfp"
+version = "0.1.0"
+edition = "2024"
+description = "出口 TCP 指纹跟随设备系统的 Shadowsocks 2022 服务端"
+license = "MIT"
+repository = "https://github.com/aidever/ssfp"
+
+[dependencies]
+fpcore = { path = "../fpcore" }
+shadowsocks = { version = "1.25", default-features = false, features = ["aead-cipher-2022"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "io-util", "sync", "signal"] }
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+anyhow = "1"
+huginn-net-tls = "2.2.1"
+aya = "0.16.0"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

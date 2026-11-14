@@ -1,0 +1,10 @@
+[package]
+name = "fpcore"
+version = "0.1.0"
+edition = "2024"
+description = "SYN 解析与出口指纹模板（ssfp 与 fpprobe 共用）"
+license = "MIT"
+repository = "https://github.com/aidever/ssfp"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

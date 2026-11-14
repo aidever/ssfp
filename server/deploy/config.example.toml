@@ -1,0 +1,46 @@
+# ssfp 配置示例 —— /etc/ssfp/config.toml
+listen = "0.0.0.0:8388"
+method = "2022-blake3-aes-128-gcm"
+# 服务端 PSK：openssl rand -base64 16（aes-256-gcm 用 32）
+password = "REPLACE_ME"
+
+# 出口地址（有独立出口 IP 时填写，与入口分开）
+# egress_v4 = "203.0.113.10"
+# egress_v6 = "2001:db8::10"
+
+# auto = 按 UA / JA4 表 / 客户端 SYN 判定；或固定 windows / apple / android / linux / none
+default_template = "auto"
+
+# 在出口网卡 egress 挂 eBPF 改写 SYN 选项布局与窗口（需要 CAP_NET_ADMIN + CAP_BPF，内核 ≥ 5.x）
+# Windows 模板 wscale 8 需要 net.ipv4.tcp_rmem 第三个值 ≥ 12582912
+syn_rewrite_iface = "eth0"
+syn_rewrite_l3_offset = 14   # 以太网 14；tun / wireguard 等无二层头的设备填 0
+
+udp = true
+block_quic = true            # 丢弃 UDP 443，浏览器回落 TCP
+udp_idle_s = 120
+block_private = true
+first_data_wait_ms = 50
+connect_timeout_s = 10
+log = "/var/log/ssfp/conn.jsonl"
+
+# 看板 + 订阅：只听内网 / VPN 地址（经本服务访问时自动放行该地址）
+console_listen = "127.0.0.1:43480"
+state_dir = "/var/lib/ssfp"
+# 链接和订阅里写的服务器地址
+# public_host = "203.0.113.10"
+
+# 用户和设备在看板或 `ssfp ctl` 里管理（存于 state_dir/state.json）。
+# 下面的 [[users]] 只在第一次启动、state.json 还不存在时导入到用户"默认"。
+
+[[users]]
+name = "alice"
+password = "REPLACE_ME_USER_PSK"
+
+[[users]]
+name = "router"              # 软路由后面多台设备时固定模板
+password = "REPLACE_ME_USER_PSK2"
+template = "windows"
+
+# JA4 → OS 表：用 tools/ja4_table.py 从 fpprobe 的 visits.jsonl 生成，不要手写猜测
+[ja4]
