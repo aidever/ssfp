@@ -4,6 +4,7 @@
 //! ssfp ctl user add <名称> | del <用户> | rename <用户> <新名> | enable|disable <用户>
 //! ssfp ctl dev add <用户> <设备名> [模板] | del <设备> | rename <设备> <新名>
 //!              | os <设备> <模板> | enable|disable <设备> | rotate <设备> | link <设备>
+//!              | test <设备> [主机:端口]
 //! ssfp ctl sub <用户> [--dialer 节点名]
 //!
 //! <用户> 可以写名称或编号；<设备> 写编号，或 "用户/设备名"。模板：auto windows apple android linux none
@@ -25,6 +26,7 @@ const HELP: &str = "用法：
   ssfp ctl dev os <设备> <模板>
   ssfp ctl dev del|enable|disable|rotate|link <设备>
   ssfp ctl dev rename <设备> <新名称>
+  ssfp ctl dev test <设备> [主机:端口]         以该设备身份经本机 ssfp 访问目标（默认 example.com:80），检查链路与 SYN 改写
   ssfp ctl sub <用户> [--dialer 节点名]       打印 Clash 订阅内容与订阅地址
 <用户> 写名称或编号；<设备> 写编号或 用户/设备名。默认配置 /etc/ssfp/config.toml，用 -c 指定。";
 
@@ -87,6 +89,94 @@ impl Client {
         }
         bail!("没有设备 {s}（写编号或 用户/设备名）")
     }
+}
+
+/// 带令牌 GET 看板接口（ssfp check 也用）
+pub async fn get_json(addr: std::net::SocketAddr, token: &str, path: &str) -> anyhow::Result<Value> {
+    let c = Client { addr, token: token.to_string() };
+    tokio::time::timeout(std::time::Duration::from_secs(5), c.json("GET", path, None)).await.context("超时")?
+}
+
+/// 以设备身份经本机 ssfp 发一个 HTTP HEAD，返回 (状态行, eBPF 计数前后差)
+async fn self_test(cfg: &Config, c: &Client, dev_id: u64, target: &str) -> anyhow::Result<()> {
+    use shadowsocks::ProxyClientStream;
+    use shadowsocks::config::{ServerConfig, ServerType};
+    use shadowsocks::relay::Address;
+
+    let state = std::path::Path::new(&cfg.state_dir).join("state.json");
+    let data: crate::store::Data = serde_json::from_str(&std::fs::read_to_string(&state).with_context(|| format!("读取 {}", state.display()))?)?;
+    let dev = data.devices.iter().find(|x| x.id as u64 == dev_id).context("state.json 里没有这台设备")?;
+    anyhow::ensure!(dev.enabled, "设备已停用");
+    let method: shadowsocks::crypto::CipherKind = cfg.method.parse().map_err(|_| anyhow::anyhow!("加密方式无效"))?;
+    let mut svr = cfg.listen;
+    if svr.ip().is_unspecified() {
+        svr.set_ip(if svr.is_ipv4() { std::net::Ipv4Addr::LOCALHOST.into() } else { std::net::Ipv6Addr::LOCALHOST.into() });
+    }
+    let sc = ServerConfig::new(svr, format!("{}:{}", cfg.password, dev.key), method).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (host, port) = target.rsplit_once(':').context("目标写成 主机:端口")?;
+    let port: u16 = port.parse().context("端口无效")?;
+    let addr = match host.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>() {
+        Ok(ip) => Address::SocketAddress((ip, port).into()),
+        Err(_) => Address::DomainNameAddress(host.to_string(), port),
+    };
+    let stats = |v: &Value, k: &str| v["ebpf_stats"][k].as_u64().unwrap_or(0);
+    let before = c.json("GET", "/api/overview", None).await?;
+
+    let ctx = shadowsocks::context::Context::new_shared(ServerType::Local);
+    let started = std::time::Instant::now();
+    let res = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let mut s = ProxyClientStream::connect(ctx, &sc, addr).await?;
+        let req = format!("HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: ssfp-selftest\r\nConnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await?;
+        let mut buf = vec![0u8; 512];
+        let mut got = Vec::new();
+        while !got.contains(&b'\n') && got.len() < 4096 {
+            let n = s.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        anyhow::Ok(got)
+    })
+    .await;
+    let after = c.json("GET", "/api/overview", None).await?;
+    // 服务端记录的原因（连接日志最后一条属于这台设备的记录）
+    let reason = || {
+        let label = data.users.iter().find(|u| u.id == dev.user_id).map(|u| format!("{}/{}", u.name, dev.name)).unwrap_or_default();
+        cfg.log
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| {
+                t.lines().rev().take(200).filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v["user"] == label.as_str())
+            })
+            .and_then(|v| v["error"].as_str().map(|e| format!("；服务端记录：{e}（解析结果 {}）", v["resolved"])))
+            .unwrap_or_else(|| "；服务端原因见 journalctl -u ssfp 或连接日志".into())
+    };
+    let got = match res {
+        Ok(Ok(g)) => g,
+        Ok(Err(e)) => bail!("FAIL 经 ssfp 连接 {target} 失败：{e:#}{}", reason()),
+        Err(_) => bail!("FAIL 经 ssfp 连接 {target} 超时（15 秒）{}", reason()),
+    };
+    let line = String::from_utf8_lossy(&got).lines().next().unwrap_or("").to_string();
+    anyhow::ensure!(!line.is_empty(), "FAIL 目标 {target} 没有返回数据{}", reason());
+    println!("OK   以设备 {}（模板 {}）经 ssfp 访问 {target}：{line}（{} ms）", dev.name, dev.template, started.elapsed().as_millis());
+
+    if after["ebpf_iface"].is_null() {
+        println!("WARN eBPF 未挂载，SYN 选项布局没有改写（ssfp check 查看原因）");
+        return Ok(());
+    }
+    let d = |k: &str| stats(&after, k).saturating_sub(stats(&before, k));
+    let (rw, un, fail) = (d("rewritten"), d("unchanged"), d("parse_fail") + d("adjust_fail") + d("store_fail"));
+    let expect_rewrite = matches!(dev.template.as_str(), "windows" | "apple" | "android");
+    if fail > 0 {
+        println!("FAIL eBPF 改写出错 {fail} 次（parse/adjust/store），看 journalctl -u ssfp");
+    } else if expect_rewrite && rw == 0 {
+        println!("FAIL 模板 {} 的 SYN 应被改写，但 eBPF 计数没有变化：出站可能没走 {}", dev.template, after["ebpf_iface"]);
+    } else {
+        println!("OK   eBPF：本次改写 {rw} 个 SYN，原样放行 {un} 个（linux / none 模板不需要改写）");
+    }
+    Ok(())
 }
 
 pub fn human(b: u64) -> String {
@@ -201,6 +291,11 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
             let (_, dv) = c.device(d).await?;
             c.json("PATCH", &format!("/api/devices/{}", dv["id"]), Some(json!({ "template": tpl }))).await?;
             println!("完成（该设备的现有连接已断开，客户端会自动重连）");
+        }
+        ["dev", "test", d, rest @ ..] => {
+            let (_, dv) = c.device(d).await?;
+            let target = rest.first().copied().unwrap_or("example.com:80");
+            self_test(&cfg, &c, dv["id"].as_u64().unwrap_or(0), target).await?;
         }
         ["dev", "rename", d, name] => {
             let (_, dv) = c.device(d).await?;

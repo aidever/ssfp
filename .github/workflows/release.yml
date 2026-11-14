@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang musl-tools linux-libc-dev
+      - run: rustup target add "$TARGET"
+      - name: build
+        working-directory: server
+        run: |
+          export CC_${TARGET//-/_}=musl-gcc
+          cargo build --release --locked --target "$TARGET"
+      - name: test
+        working-directory: server
+        run: cargo test --release --locked
+      - name: package
+        run: |
+          d=ssfp-${{ matrix.arch }}-linux-musl
+          mkdir -p "$d"
+          cp "server/target/$TARGET/release/ssfp" "$d/"
+          cp server/deploy/ssfp.service server/deploy/99-ssfp.conf server/deploy/config.example.toml LICENSE "$d/"
+          "$d/ssfp" version
+          tar czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssfp-${{ matrix.arch }}
+          path: ssfp-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum ssfp-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" dist/* --title "ssfp $tag" --generate-notes || gh release upload "$tag" dist/* --clobber

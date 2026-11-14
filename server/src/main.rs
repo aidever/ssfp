@@ -6,6 +6,7 @@
 //! - 按模板设置出站 socket（TTL、TCP_WINDOW_CLAMP 控 wscale、SO_MARK → eBPF 改写 SYN），bind 出口 IP
 //! - connect 成功后立刻写首包；按设备统计流量；每条连接写一行 JSON 日志
 
+mod admin;
 mod classify;
 mod config;
 mod console;
@@ -51,6 +52,8 @@ pub struct State {
     admin_token: String,
     public_host: String,
     ebpf_iface: Option<String>,
+    ebpf_error: Option<String>,
+    ebpf: std::sync::Mutex<Option<ebpf::SynRewriter>>,
 }
 
 #[derive(Serialize, Default)]
@@ -105,7 +108,17 @@ impl State {
         match &self.log {
             Some(f) => {
                 use std::io::Write;
-                let _ = writeln!(f.lock().unwrap(), "{line}");
+                let mut f = f.lock().unwrap();
+                let _ = writeln!(f, "{line}");
+                // 超过 LOG_MAX 时轮转为 .1（只保留一份旧文件）
+                if f.metadata().map(|m| m.len() > LOG_MAX).unwrap_or(false) {
+                    if let Some(p) = &self.cfg.log {
+                        let _ = std::fs::rename(p, format!("{p}.1"));
+                        if let Ok(nf) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                            *f = nf;
+                        }
+                    }
+                }
             }
             None => eprintln!("{line}"),
         }
@@ -288,13 +301,35 @@ pub fn admin_token(dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(t)
 }
 
+/// 连接日志轮转阈值
+const LOG_MAX: u64 = 64 << 20;
+
+const MAIN_HELP: &str = "ssfp —— 出口 TCP 指纹跟随设备系统的 Shadowsocks 2022 服务端
+用法：
+  ssfp [配置路径]        运行服务（默认 /etc/ssfp/config.toml）
+  ssfp init [...]        生成配置（ssfp init --help）
+  ssfp check [-c 配置]   体检：配置、内核参数、服务与 eBPF 状态
+  ssfp ctl ...           管理用户 / 设备 / 订阅（ssfp ctl help）
+  ssfp version";
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    if args.get(1).map(String::as_str) == Some("ctl") {
-        return rt.block_on(ctl::run(&args[2..]));
+    match args.get(1).map(String::as_str) {
+        Some("ctl") => return rt.block_on(ctl::run(&args[2..])),
+        Some("init") => return admin::run_init(&args[2..]),
+        Some("check") => return rt.block_on(admin::run_check(&args[2..])),
+        Some("version" | "--version" | "-V") => {
+            println!("ssfp {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("help" | "--help" | "-h") => {
+            println!("{MAIN_HELP}");
+            return Ok(());
+        }
+        _ => {}
     }
-    rt.block_on(serve(args.get(1).cloned().unwrap_or_else(|| "/etc/ssfp/config.toml".into())))
+    rt.block_on(serve(args.get(1).cloned().unwrap_or_else(|| admin::DEFAULT_CONFIG.into())))
 }
 
 async fn serve(path: String) -> anyhow::Result<()> {
@@ -326,17 +361,30 @@ async fn serve(path: String) -> anyhow::Result<()> {
         devices,
         cfg.default_template
     );
+    // eBPF 挂不上（容器 / OpenVZ / 老内核）时继续运行：TTL、wscale 仍按模板，只是 SYN 选项布局和窗口不改
+    let mut ebpf_error = None;
     let rewriter = match &cfg.syn_rewrite_iface {
-        Some(iface) => {
-            let r = ebpf::SynRewriter::attach(iface, cfg.syn_rewrite_l3_offset)?;
-            eprintln!("eBPF SYN 改写已挂到 {iface} egress");
-            Some(r)
+        Some(iface) => match ebpf::SynRewriter::attach(iface, cfg.syn_rewrite_l3_offset) {
+            Ok(r) => {
+                eprintln!("eBPF SYN 改写已挂到 {iface} egress（L3 偏移 {}）", cfg.syn_rewrite_l3_offset);
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("警告：eBPF SYN 改写没有挂上，只改 TTL / wscale：{e:#}");
+                ebpf_error = Some(format!("{e:#}"));
+                None
+            }
+        },
+        None => {
+            eprintln!("未启用 eBPF SYN 改写（syn_rewrite_iface = off 或找不到默认路由网卡）");
+            None
         }
-        None => None,
     };
     let public_host = cfg.public_host.clone().unwrap_or_else(default_public_host);
     let st = Arc::new(State {
         ebpf_iface: rewriter.as_ref().and(cfg.syn_rewrite_iface.clone()),
+        ebpf_error,
+        ebpf: std::sync::Mutex::new(rewriter),
         cfg,
         method,
         svr: svr.clone(),
@@ -368,7 +416,6 @@ async fn serve(path: String) -> anyhow::Result<()> {
     // 定时：5 秒采样速率；60 秒记账落盘、写 eBPF 计数
     {
         let st2 = st.clone();
-        let mut rewriter = rewriter;
         tokio::spawn(async move {
             let mut tick = 0u64;
             let mut iv = tokio::time::interval(Duration::from_secs(5));
@@ -379,7 +426,8 @@ async fn serve(path: String) -> anyhow::Result<()> {
                 if tick % 12 == 0 {
                     st2.traffic.roll();
                     st2.store.flush();
-                    if let Some(v) = rewriter.as_mut().and_then(|r| r.stats_delta()) {
+                    let delta = st2.ebpf.lock().unwrap().as_mut().and_then(|r| r.stats_delta());
+                    if let Some(v) = delta {
                         st2.write_value(&v);
                     }
                 }

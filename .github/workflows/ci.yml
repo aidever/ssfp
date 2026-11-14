@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang linux-libc-dev
+      - run: cargo test --release --locked
+        working-directory: fpcore
+      - run: cargo test --release --locked
+        working-directory: server
+      - name: shell scripts
+        run: bash -n install.sh

@@ -257,6 +257,8 @@ fn overview(st: &State) -> Value {
         "public_host": st.public_host,
         "console": st.cfg.console_listen.map(|a| a.to_string()),
         "ebpf_iface": st.ebpf_iface,
+        "ebpf_error": st.ebpf_error,
+        "ebpf_stats": st.ebpf.lock().unwrap().as_ref().map(|r| r.stats_total()),
         "udp": st.cfg.udp,
         "block_quic": st.cfg.block_quic,
         "conns": st.traffic.conn_count(),
@@ -347,7 +349,8 @@ fn check_name(s: &str) -> Result<String, Resp> {
 fn check_template(s: &str) -> Result<String, Resp> {
     let s = s.trim().to_ascii_lowercase();
     let s = match s.as_str() {
-        "macos" | "ios" => "apple".to_string(),
+        "macos" | "mac" | "ios" | "iphone" | "ipad" | "ipados" => "apple".to_string(),
+        "win" | "win10" | "win11" => "windows".to_string(),
         _ => s,
     };
     if TEMPLATES.contains(&s.as_str()) { Ok(s) } else { Err(err(StatusCode::BAD_REQUEST, format!("模板只能是 {}", TEMPLATES.join(" / ")))) }

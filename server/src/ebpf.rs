@@ -109,6 +109,18 @@ impl SynRewriter {
         Ok(Self { bpf, last: vec![0; STAT_NAMES.len()] })
     }
 
+    /// 启动以来的累计计数
+    pub fn stats_total(&self) -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        if let Some(arr) = self.bpf.map("stats").and_then(|m| PerCpuArray::<_, u64>::try_from(m).ok()) {
+            for (i, name) in STAT_NAMES.iter().enumerate() {
+                let total: u64 = arr.get(&(i as u32), 0).map(|v| v.iter().sum()).unwrap_or(0);
+                out.insert((*name).into(), total.into());
+            }
+        }
+        out.into()
+    }
+
     /// 返回自上次调用以来各计数的增量（全为 0 时返回 None）
     pub fn stats_delta(&mut self) -> Option<serde_json::Value> {
         let arr: PerCpuArray<_, u64> = PerCpuArray::try_from(self.bpf.map("stats")?).ok()?;

@@ -11,10 +11,11 @@ password = "REPLACE_ME"
 # auto = 按 UA / JA4 表 / 客户端 SYN 判定；或固定 windows / apple / android / linux / none
 default_template = "auto"
 
-# 在出口网卡 egress 挂 eBPF 改写 SYN 选项布局与窗口（需要 CAP_NET_ADMIN + CAP_BPF，内核 ≥ 5.x）
-# Windows 模板 wscale 8 需要 net.ipv4.tcp_rmem 第三个值 ≥ 12582912
-syn_rewrite_iface = "eth0"
-syn_rewrite_l3_offset = 14   # 以太网 14；tun / wireguard 等无二层头的设备填 0
+# 在出口网卡 egress 挂 eBPF 改写 SYN 选项布局与窗口（需要 CAP_NET_ADMIN + CAP_BPF）
+# auto = 默认路由所在网卡；off = 不挂（只改 TTL / wscale）；也可写网卡名，如 "eth0"
+# Windows 模板 wscale 8 需要 net.ipv4.tcp_rmem 第三个值 ≥ 12582912，Android wscale 9 需要 ≥ 25165824（见 99-ssfp.conf）
+syn_rewrite_iface = "auto"
+# syn_rewrite_l3_offset = 14   # 不填时按网卡类型判断：以太网 14，tun / wireguard / ppp 0
 
 udp = true
 block_quic = true            # 丢弃 UDP 443，浏览器回落 TCP
@@ -24,7 +25,8 @@ first_data_wait_ms = 50
 connect_timeout_s = 10
 log = "/var/log/ssfp/conn.jsonl"
 
-# 看板 + 订阅：只听内网 / VPN 地址（经本服务访问时自动放行该地址）
+# 看板 + 订阅：默认只听本机，用 SSH 端口转发打开（ssh -L 43480:127.0.0.1:43480 服务器）。
+# 也可以设为只有经代理才能到的地址（例如给 lo 加 10.255.0.1/32 后写 "10.255.0.1:43480"），本服务会放行到该地址的连接
 console_listen = "127.0.0.1:43480"
 state_dir = "/var/lib/ssfp"
 # 链接和订阅里写的服务器地址

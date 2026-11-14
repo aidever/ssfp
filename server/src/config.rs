@@ -79,12 +79,12 @@ struct RawConfig {
     connect_timeout_s: u64,
     #[serde(default)]
     log: Option<String>,
-    /// 在这个网卡的 egress 挂 eBPF 改写 SYN（M4）；设置后自动开启 set_mark
+    /// 在这个网卡的 egress 挂 eBPF 改写 SYN；"auto"（默认）= 默认路由的网卡，"off" = 不挂
+    #[serde(default = "d_auto")]
+    syn_rewrite_iface: String,
+    /// 该网卡上 L3 头的偏移：以太网 14，tun/wireguard 等无二层头的设备 0；不填时按网卡类型判断
     #[serde(default)]
-    syn_rewrite_iface: Option<String>,
-    /// 该网卡上 L3 头的偏移：以太网 14，tun/wireguard 等无二层头的设备 0
-    #[serde(default = "d_l3")]
-    syn_rewrite_l3_offset: u32,
+    syn_rewrite_l3_offset: Option<u32>,
     /// 开启 UDP 中继
     #[serde(default = "d_true")]
     udp: bool,
@@ -125,8 +125,8 @@ fn d_state() -> String {
 fn d_idle() -> u64 {
     120
 }
-fn d_l3() -> u32 {
-    14
+fn d_auto() -> String {
+    "auto".into()
 }
 fn d_connect() -> u64 {
     10
@@ -164,6 +164,11 @@ impl Config {
         for u in &r.users {
             u.template()?;
         }
+        let iface = match r.syn_rewrite_iface.trim() {
+            "" | "off" | "none" => None,
+            "auto" => default_iface(),
+            n => Some(n.to_string()),
+        };
         let mut ja4 = HashMap::new();
         for (k, v) in &r.ja4 {
             let f = Family::from_name(v).with_context(|| format!("JA4 表里 {k} 的值 {v} 不是 windows / apple / linux"))?;
@@ -180,9 +185,9 @@ impl Config {
             first_data_wait_ms: r.first_data_wait_ms.min(1000),
             default_template: TemplateChoice::parse(&r.default_template)?,
             block_private: r.block_private,
-            set_mark: r.set_mark || r.syn_rewrite_iface.is_some(),
-            syn_rewrite_iface: r.syn_rewrite_iface,
-            syn_rewrite_l3_offset: r.syn_rewrite_l3_offset,
+            set_mark: r.set_mark || iface.is_some(),
+            syn_rewrite_l3_offset: r.syn_rewrite_l3_offset.unwrap_or_else(|| iface.as_deref().map(l3_offset_of).unwrap_or(14)),
+            syn_rewrite_iface: iface,
             connect_timeout_s: r.connect_timeout_s,
             log: r.log,
             udp: r.udp,
@@ -192,6 +197,33 @@ impl Config {
             state_dir: r.state_dir,
             public_host: r.public_host,
         })
+    }
+}
+
+/// 默认路由（IPv4，其次 IPv6）所在的网卡
+pub fn default_iface() -> Option<String> {
+    let v4 = std::fs::read_to_string("/proc/net/route").ok().and_then(|t| {
+        t.lines().skip(1).find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() > 7 && f[1] == "00000000" && f[7] == "00000000").then(|| f[0].to_string())
+        })
+    });
+    v4.or_else(|| {
+        std::fs::read_to_string("/proc/net/ipv6_route").ok().and_then(|t| {
+            t.lines().find_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                (f.len() == 10 && f[0] == "00000000000000000000000000000000" && f[1] == "00" && f[9] != "lo")
+                    .then(|| f[9].to_string())
+            })
+        })
+    })
+}
+
+/// 网卡的 L3 偏移：以太网类（ARPHRD_ETHER = 1）14，其余（tun、wireguard、ppp）0
+pub fn l3_offset_of(iface: &str) -> u32 {
+    match std::fs::read_to_string(format!("/sys/class/net/{iface}/type")).map(|s| s.trim().to_string()) {
+        Ok(t) if t != "1" => 0,
+        _ => 14,
     }
 }
 
