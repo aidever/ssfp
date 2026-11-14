@@ -7,11 +7,11 @@
 
 ssfp 给每台设备一把密钥，按设备的系统模板发出站连接：Windows 设备出去的 SYN 就是 Windows 的样子，Mac 就是 Mac 的样子。
 
-> English summary: ssfp is a Shadowsocks 2022 server whose outbound TCP/IP fingerprint (TTL, window, window scale, option layout, timestamps) matches the client device's OS. Each device gets its own key mapped to an OS template; SYN option layout is rewritten by a small TC eBPF program. Includes a web console, a CLI, Clash subscriptions, per-device traffic stats, and `fpprobe`, a detection target that shows what a website sees.
+> English summary: ssfp is a Shadowsocks 2022 server whose outbound TCP/IP fingerprint (TTL, window, window scale, option layout, timestamps) matches the client device's OS. Each device gets its own key mapped to an OS template; SYN option layout is rewritten by a small TC eBPF program. Includes a web console, a CLI, Clash subscriptions and per-device traffic stats. Companion test target: https://github.com/aidever/fpprobe
 
 ## 实测
 
-出口为同一台 Linux 服务器，目标为本仓库的 `fpprobe` 靶机，p0f 识别结果：
+出口为同一台 Linux 服务器，目标为 [fpprobe](https://github.com/aidever/fpprobe) 靶机，p0f 识别结果：
 
 | 设备模板 | 网站看到的 SYN | p0f 判定 |
 |---|---|---|
@@ -31,7 +31,6 @@ ssfp 给每台设备一把密钥，按设备的系统模板发出站连接：Win
 - **`ssfp ctl` 命令行**：增删用户和设备、打印链接与 Clash 订阅
 - **Clash 订阅**：每台设备一个节点 + 一个包含全部节点的分组，可带 `dialer-proxy`
 - **其他出口特征**：首包随连接建立立即发出（没有"握手完空等"的间隔）；默认丢弃 UDP 443（QUIC），让浏览器走 TCP；默认拒绝访问内网地址
-- **`fpprobe` 检测靶机**：记录访客的 TCP SYN（p0f）、TLS ClientHello（JA4）、HTTP UA 与时序，网页上给出"TCP 层系统与浏览器是否一致"等判定
 
 ## 工作原理
 
@@ -57,7 +56,6 @@ flowchart LR
 |---|---|
 | `server/` | `ssfp` 服务端：SS2022 中继、eBPF 程序（`bpf/`）、看板（`src/console.*`）、`ssfp ctl`、部署样例（`deploy/`） |
 | `fpcore/` | SYN 解析与指纹模板，服务端和靶机共用 |
-| `probe/` | `fpprobe` 检测靶机 |
 | `tools/ja4_table.py` | 从 `fpprobe` 访问记录生成 JA4 → 系统对照表（可选） |
 
 ## 构建
@@ -72,8 +70,6 @@ cd server
 cargo build --release --target x86_64-unknown-linux-musl   # 静态二进制：target/x86_64-unknown-linux-musl/release/ssfp
 cargo test --release
 ```
-
-`fpprobe` 同理：`cd probe && cargo build --release --target x86_64-unknown-linux-musl`。
 
 ## 部署
 
@@ -151,14 +147,9 @@ proxy-groups:
 
 模板值在 `fpcore/src/template.rs`。想用自己的设备校准：让设备直连访问 `fpprobe`，对照网页上的 SYN 字段修改。
 
-## fpprobe 检测靶机
+## 检测靶机
 
-```sh
-fpprobe --iface eth0 --tls-port 8443 --http-port 8080 \
-        --cert fullchain.pem --key privkey.pem --log /var/lib/fpprobe/visits.jsonl
-```
-
-需要 `CAP_NET_RAW`（抓 SYN）。浏览器打开 `https://靶机域名:8443/`，页面显示网站能看到的内容：TCP SYN 与 p0f 判定、TLS JA4、UA、握手 RTT 与应用层 RTT，并判断"TCP 层系统与浏览器自报系统是否一致"、"RTT 是否像经过代理"。分别直连和经 ssfp 访问一次，就能对比效果。
+靶机已拆成独立项目 [fpprobe](https://github.com/aidever/fpprobe)，提供 Docker 镜像 `ghcr.io/aidever/fpprobe`。网页显示网站能看到的 TCP SYN 与 p0f 判定、TLS JA4、UA、握手 RTT 与应用层 RTT，并判断"TCP 层系统与浏览器自报系统是否一致"。分别直连和经 ssfp 访问一次，就能对比效果。
 
 ## 局限
 
