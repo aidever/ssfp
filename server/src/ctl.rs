@@ -115,6 +115,7 @@ async fn self_test(cfg: &Config, c: &Client, dev_id: u64, target: &str) -> anyho
     let sc = ServerConfig::new(svr, format!("{}:{}", cfg.password, dev.key), method).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (host, port) = target.rsplit_once(':').context("目标写成 主机:端口")?;
     let port: u16 = port.parse().context("端口无效")?;
+    let addr_ip = host.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>().ok();
     let addr = match host.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>() {
         Ok(ip) => Address::SocketAddress((ip, port).into()),
         Err(_) => Address::DomainNameAddress(host.to_string(), port),
@@ -173,7 +174,12 @@ async fn self_test(cfg: &Config, c: &Client, dev_id: u64, target: &str) -> anyho
     }
     let d = |k: &str| stats(&after, k).saturating_sub(stats(&before, k));
     let (rw, un, fail) = (d("rewritten"), d("unchanged"), d("parse_fail") + d("adjust_fail") + d("store_fail"));
-    let expect_rewrite = matches!(dev.template.as_str(), "windows" | "apple" | "android");
+    // 内网 / 本机目标走 lo 等网卡，不经过挂 eBPF 的出口网卡，不检查改写
+    let public_target = match &addr_ip {
+        Some(ip) => crate::net::is_public(*ip),
+        None => true,
+    };
+    let expect_rewrite = public_target && matches!(dev.template.as_str(), "windows" | "apple" | "android");
     if fail > 0 {
         println!("FAIL eBPF 改写出错 {fail} 次（parse/adjust/store），看 journalctl -u ssfp");
     } else if expect_rewrite && rw == 0 {
