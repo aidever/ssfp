@@ -181,7 +181,7 @@ impl Store {
             changed: tx,
             dirty: false.into(),
         });
-        s.commit()?;
+        s.commit(true)?;
         Ok(s)
     }
 
@@ -207,11 +207,12 @@ impl Store {
             let mut d = self.data.lock().unwrap();
             f(&mut d)?
         };
-        self.commit()?;
+        self.commit(true)?;
         Ok(r)
     }
 
-    fn commit(&self) -> anyhow::Result<()> {
+    /// 重建快照；save = false 时只标记 dirty，由定时 flush 落盘（转发路径上不写磁盘）
+    fn commit(&self, save: bool) -> anyhow::Result<()> {
         let d = self.data.lock().unwrap();
         let mut um = ServerUserManager::new();
         let mut by_key = HashMap::new();
@@ -238,7 +239,11 @@ impl Store {
                 },
             );
         }
-        self.save_locked(&d)?;
+        if save {
+            self.save_locked(&d)?;
+        } else {
+            self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         drop(d);
         *self.snap.write().unwrap() = Arc::new(Snapshot { users: Some(Arc::new(um)), by_key });
         self.changed.send_modify(|v| *v += 1);
@@ -278,7 +283,7 @@ impl Store {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(d);
         if changed {
-            let _ = self.commit();
+            let _ = self.commit(false);
         }
     }
 

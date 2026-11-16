@@ -96,22 +96,159 @@ fn prepare(a: SocketAddr, tpl: &Template, cfg: &Config) -> anyhow::Result<TcpSoc
     if let Some(ip) = bind {
         s.bind(&SocketAddr::new(ip, 0).into()).with_context(|| format!("绑定出口 {ip}"))?;
     }
+    set_keepalive(socket2::SockRef::from(&s), cfg.tcp_keepalive_s).context("设置 keepalive")?;
     s.set_nonblocking(true)?;
     Ok(TcpSocket::from_std_stream(std::net::TcpStream::from(s)))
 }
 
-/// 依次尝试解析出的地址，返回第一个连上的。
-pub async fn dial(targets: &[SocketAddr], tpl: &Template, cfg: &Config, timeout: Duration) -> anyhow::Result<(TcpStream, SocketAddr)> {
-    let mut last = None;
-    for &a in targets {
-        let sock = prepare(a, tpl, cfg)?;
-        match tokio::time::timeout(timeout, sock.connect(a)).await {
-            Ok(Ok(s)) => return Ok((s, a)),
-            Ok(Err(e)) => last = Some(anyhow::anyhow!("连接 {a} 失败: {e}")),
-            Err(_) => last = Some(anyhow::anyhow!("连接 {a} 超时")),
+/// TCP keepalive：空闲 secs 秒后开始探测，间隔 secs/3，3 次无响应断开；
+/// 同时设 TCP_USER_TIMEOUT，已发数据长时间收不到 ACK（对端消失）时也能断开。secs = 0 时不设置。
+pub fn set_keepalive(s: socket2::SockRef<'_>, secs: u64) -> io::Result<()> {
+    if secs == 0 {
+        return Ok(());
+    }
+    let t = Duration::from_secs(secs);
+    let iv = Duration::from_secs((secs / 3).max(1));
+    s.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(t).with_interval(iv).with_retries(3))?;
+    s.set_tcp_user_timeout(Some(t + iv * 3))
+}
+
+/// Happy Eyeballs（RFC 8305）里两次尝试之间的间隔
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// IPv6 / IPv4 交替排列；首个地址族按解析结果的顺序，prefer_ipv4 时 IPv4 在前
+fn interleave(targets: &[SocketAddr], prefer_ipv4: bool) -> Vec<SocketAddr> {
+    let (v4, v6): (Vec<SocketAddr>, Vec<SocketAddr>) = targets.iter().partition(|a| a.is_ipv4());
+    let v4_first = prefer_ipv4 && !v4.is_empty() || targets.first().is_some_and(|a| a.is_ipv4());
+    let (a, b) = if v4_first { (v4, v6) } else { (v6, v4) };
+    let mut out = Vec::with_capacity(targets.len());
+    let (mut ia, mut ib) = (a.into_iter(), b.into_iter());
+    loop {
+        match (ia.next(), ib.next()) {
+            (None, None) => break,
+            (x, y) => out.extend(x.into_iter().chain(y)),
         }
     }
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("没有可连接的地址")))
+    out
+}
+
+/// Happy Eyeballs 拨号：按交替顺序每 250ms 发起一个新尝试（上一个失败则立刻发起），
+/// 第一个连上的胜出，其余取消；整个过程不超过 timeout。
+pub async fn dial(targets: &[SocketAddr], tpl: &Template, cfg: &Config, timeout: Duration) -> anyhow::Result<(TcpStream, SocketAddr)> {
+    let order = interleave(targets, cfg.prefer_ipv4);
+    match tokio::time::timeout(timeout, race(&order, tpl, cfg)).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("连接超时（{} 秒内 {} 个地址都没连上：{:?}）", timeout.as_secs(), order.len(), order)),
+    }
+}
+
+async fn race(order: &[SocketAddr], tpl: &Template, cfg: &Config) -> anyhow::Result<(TcpStream, SocketAddr)> {
+    let mut set = tokio::task::JoinSet::new();
+    let mut next = 0;
+    let mut last: Option<anyhow::Error> = None;
+    loop {
+        // 发起下一个尝试
+        if next < order.len() {
+            let a = order[next];
+            next += 1;
+            match prepare(a, tpl, cfg) {
+                Ok(sock) => {
+                    set.spawn(async move { sock.connect(a).await.map(|s| (s, a)).map_err(|e| (a, e)) });
+                }
+                Err(e) => {
+                    last = Some(e.context(format!("准备连接 {a} 失败")));
+                    continue;
+                }
+            }
+        }
+        if set.is_empty() {
+            return Err(last.unwrap_or_else(|| anyhow::anyhow!("没有可连接的地址")));
+        }
+        let more = next < order.len();
+        tokio::select! {
+            r = set.join_next() => match r {
+                Some(Ok(Ok(x))) => return Ok(x), // set 被丢弃时其余尝试自动取消
+                Some(Ok(Err((a, e)))) => last = Some(anyhow::anyhow!("连接 {a} 失败: {e}")),
+                Some(Err(e)) => last = Some(anyhow::anyhow!("连接任务异常: {e}")),
+                None => {}
+            },
+            _ = tokio::time::sleep(ATTEMPT_DELAY), if more => {}
+        }
+    }
+}
+
+/// 主机名 → (解析结果, 过期时间)
+type DnsCache = std::collections::HashMap<String, (Result<Vec<IpAddr>, String>, std::time::Instant)>;
+
+/// 带超时和缓存的域名解析（TCP 与 UDP 共用）
+pub struct Resolver {
+    cache: std::sync::Mutex<DnsCache>,
+    timeout: Duration,
+    ttl: Duration,
+}
+
+const DNS_NEG_TTL: Duration = Duration::from_secs(5);
+const DNS_CACHE_MAX: usize = 4096;
+
+impl Resolver {
+    pub fn new(cfg: &Config) -> Self {
+        Self {
+            cache: Default::default(),
+            timeout: Duration::from_secs(cfg.dns_timeout_s),
+            ttl: Duration::from_secs(cfg.dns_cache_s),
+        }
+    }
+
+    /// 只查缓存（未命中或已过期返回 None）
+    pub fn cached(&self, host: &str, port: u16) -> Option<anyhow::Result<Vec<SocketAddr>>> {
+        let key = host.trim_end_matches('.').to_ascii_lowercase();
+        let m = self.cache.lock().unwrap();
+        let (r, exp) = m.get(&key)?;
+        if *exp <= std::time::Instant::now() {
+            return None;
+        }
+        Some(match r {
+            Ok(ips) => Ok(ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect()),
+            Err(e) => Err(anyhow::anyhow!("域名解析失败: {e}")),
+        })
+    }
+
+    pub async fn resolve(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+        if let Some(r) = self.cached(host, port) {
+            return r;
+        }
+        let key = host.trim_end_matches('.').to_ascii_lowercase();
+        let r: Result<Vec<IpAddr>, String> = match tokio::time::timeout(self.timeout, tokio::net::lookup_host((host, 0))).await {
+            Ok(Ok(it)) => {
+                let mut v: Vec<IpAddr> = Vec::new();
+                for a in it {
+                    let ip = a.ip().to_canonical();
+                    if !v.contains(&ip) {
+                        v.push(ip);
+                    }
+                }
+                if v.is_empty() { Err("没有地址".into()) } else { Ok(v) }
+            }
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("超时（{} 秒）", self.timeout.as_secs())),
+        };
+        let ttl = if r.is_ok() { self.ttl } else { DNS_NEG_TTL };
+        if !ttl.is_zero() {
+            let now = std::time::Instant::now();
+            let mut m = self.cache.lock().unwrap();
+            if m.len() >= DNS_CACHE_MAX {
+                m.retain(|_, (_, exp)| *exp > now);
+                if m.len() >= DNS_CACHE_MAX {
+                    m.clear();
+                }
+            }
+            m.insert(key, (r.clone(), now + ttl));
+        }
+        match r {
+            Ok(ips) => Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()),
+            Err(e) => Err(anyhow::anyhow!("域名解析失败: {e}")),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -146,4 +283,18 @@ pub fn egress_info(s: &TcpStream) -> Option<EgressInfo> {
         rtt_ms: u32_at(68) as f64 / 1000.0,
         snd_mss: u32_at(16),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interleaves_families() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let t = [a("[2001::1]:80"), a("[2001::2]:80"), a("1.1.1.1:80"), a("1.0.0.1:80")];
+        assert_eq!(interleave(&t, false), vec![t[0], t[2], t[1], t[3]]);
+        assert_eq!(interleave(&t, true), vec![t[2], t[0], t[3], t[1]]);
+        assert_eq!(interleave(&t[2..], false), vec![t[2], t[3]]);
+    }
 }

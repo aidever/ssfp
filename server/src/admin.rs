@@ -186,6 +186,15 @@ pub async fn run_check(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
+    // SS2022 要求客户端与服务端时间相差不超过 30 秒，否则所有握手都会失败
+    match clock_synced() {
+        Some(true) => r.ok("系统时钟已由 NTP 同步"),
+        Some(false) => r.warn(
+            "系统时钟未同步：SS2022 要求两端时间相差 ≤ 30 秒，时间漂移后所有连接都会失败。请启用 NTP（timedatectl set-ntp true，或安装 chrony）",
+        ),
+        None => r.warn("无法读取时钟同步状态（adjtimex 失败）"),
+    }
+
     let rmem_max = read_trim("/proc/sys/net/ipv4/tcp_rmem")
         .and_then(|s| s.split_whitespace().nth(2).and_then(|v| v.parse::<u64>().ok()))
         .unwrap_or(0);
@@ -241,4 +250,14 @@ fn finish(r: Report) -> anyhow::Result<()> {
     }
     println!("结果：通过（{} 项警告）", r.warns);
     Ok(())
+}
+
+/// 内核的 NTP 同步状态：adjtimex 返回 TIME_ERROR 或 status 带 STA_UNSYNC 时视为未同步
+fn clock_synced() -> Option<bool> {
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::adjtimex(&mut tx) };
+    if r < 0 {
+        return None;
+    }
+    Some(r != libc::TIME_ERROR && tx.status & libc::STA_UNSYNC == 0)
 }

@@ -46,13 +46,15 @@ pub struct State {
     svr: ServerConfig,
     store: Arc<Store>,
     traffic: Arc<Traffic>,
-    log: Option<std::sync::Mutex<std::fs::File>>,
+    /// 连接日志：交给后台线程写，转发线程不碰磁盘
+    log: Option<std::sync::mpsc::SyncSender<String>>,
+    dns: net::Resolver,
     /// 客户端 IP → 最近一次 TCP 自动判定的模板，UDP 关联沿用
     recent: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (Family, Instant)>>,
     admin_token: String,
     public_host: String,
-    ebpf_iface: Option<String>,
-    ebpf_error: Option<String>,
+    ebpf_iface: std::sync::Mutex<Option<String>>,
+    ebpf_error: std::sync::Mutex<Option<String>>,
     ebpf: std::sync::Mutex<Option<ebpf::SynRewriter>>,
 }
 
@@ -106,22 +108,28 @@ impl State {
     fn write_value(&self, v: &serde_json::Value) {
         let line = v.to_string();
         match &self.log {
-            Some(f) => {
-                use std::io::Write;
-                let mut f = f.lock().unwrap();
-                let _ = writeln!(f, "{line}");
-                // 超过 LOG_MAX 时轮转为 .1（只保留一份旧文件）
-                if f.metadata().map(|m| m.len() > LOG_MAX).unwrap_or(false) {
-                    if let Some(p) = &self.cfg.log {
-                        let _ = std::fs::rename(p, format!("{p}.1"));
-                        if let Ok(nf) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                            *f = nf;
-                        }
-                    }
-                }
+            // 队列满（磁盘卡住）时丢弃这一行，不阻塞转发
+            Some(tx) => {
+                let _ = tx.try_send(line);
             }
             None => eprintln!("{line}"),
         }
+    }
+
+    /// eBPF 写包失败会丢掉 SYN（内核 1s / 3s 后重传，连接很慢甚至超时）。
+    /// 一分钟内持续失败且多于成功时摘掉程序，退回只改 TTL / wscale，保证连得上。
+    fn check_ebpf_health(&self, d: &serde_json::Value) {
+        let n = |k: &str| d[k].as_u64().unwrap_or(0);
+        let (fail, ok) = (n("store_fail"), n("rewritten"));
+        if fail < 3 || fail <= ok {
+            return;
+        }
+        let msg = format!("一分钟内 SYN 改写失败 {fail} 次、成功 {ok} 次，已自动停用 eBPF 改写（只改 TTL / wscale）");
+        eprintln!("警告：{msg}");
+        *self.ebpf.lock().unwrap() = None; // 丢弃即从网卡摘除
+        *self.ebpf_iface.lock().unwrap() = None;
+        *self.ebpf_error.lock().unwrap() = Some(msg.clone());
+        self.write_value(&serde_json::json!({ "at_unix_ms": now_ms(), "warning": msg }));
     }
 
     /// block_private 时仍放行：设备的 private_allow，以及看板 / 订阅地址
@@ -249,7 +257,7 @@ async fn relay(
     // 6. 解析目标，拒绝内网地址
     let targets: Vec<SocketAddr> = match &addr {
         Address::SocketAddress(a) => vec![*a],
-        Address::DomainNameAddress(h, p) => tokio::net::lookup_host((h.as_str(), *p)).await.context("域名解析失败")?.collect(),
+        Address::DomainNameAddress(h, p) => st.dns.resolve(h, *p).await?,
     };
     let targets: Vec<SocketAddr> = targets.into_iter().filter(|a| st.target_allowed(a, dev.as_ref())).collect();
     anyhow::ensure!(!targets.is_empty(), "目标没有可用的公网地址");
@@ -265,8 +273,8 @@ async fn relay(
         out.write_all(&first).await.context("写首包失败")?;
     }
 
-    // 8. 双向转发
-    let r = tokio::io::copy_bidirectional(stream, &mut out).await;
+    // 8. 双向转发；双向都没有数据超过 tcp_idle_s 时关闭（keepalive 只能发现对端消失，发现不了"活着但不再用"）
+    let r = relay_with_idle(stream, &mut out, &bytes, st.cfg.tcp_idle_s).await;
     log.bytes_up = bytes.up.load(Relaxed);
     log.bytes_down = bytes.down.load(Relaxed);
     if let Err(e) = r {
@@ -274,6 +282,40 @@ async fn relay(
     }
     Ok(())
 }
+
+async fn relay_with_idle(
+    a: &mut ProxyServerStream<TcpStream>,
+    b: &mut Counted<TcpStream>,
+    bytes: &traffic::ConnBytes,
+    idle_s: u64,
+) -> std::io::Result<(u64, u64)> {
+    let copy = tokio::io::copy_bidirectional_with_sizes(a, b, RELAY_BUF, RELAY_BUF);
+    if idle_s == 0 {
+        return copy.await;
+    }
+    tokio::pin!(copy);
+    let idle = Duration::from_secs(idle_s);
+    let mut iv = tokio::time::interval(Duration::from_secs(idle_s.clamp(1, 30)));
+    let mut last = (0, 0);
+    let mut quiet_since = Instant::now();
+    loop {
+        tokio::select! {
+            r = &mut copy => return r,
+            _ = iv.tick() => {
+                let now = (bytes.up.load(Relaxed), bytes.down.load(Relaxed));
+                if now != last {
+                    last = now;
+                    quiet_since = Instant::now();
+                } else if quiet_since.elapsed() >= idle {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("空闲 {idle_s} 秒，已关闭")));
+                }
+            }
+        }
+    }
+}
+
+/// 转发缓冲（每个方向）
+const RELAY_BUF: usize = 32 * 1024;
 
 fn default_public_host() -> String {
     // 取默认路由出口的 IPv4（不发包）
@@ -303,6 +345,31 @@ pub fn admin_token(dir: &std::path::Path) -> anyhow::Result<String> {
 
 /// 连接日志轮转阈值
 const LOG_MAX: u64 = 64 << 20;
+
+/// 后台写日志线程：超过 LOG_MAX 时轮转为 .1（只保留一份旧文件）
+fn spawn_log_writer(path: String) -> anyhow::Result<std::sync::mpsc::SyncSender<String>> {
+    use std::io::Write;
+    let open = |p: &str| std::fs::OpenOptions::new().create(true).append(true).open(p);
+    let mut f = std::io::BufWriter::new(open(&path).with_context(|| format!("打开日志 {path}"))?);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(8192);
+    std::thread::Builder::new().name("ssfp-log".into()).spawn(move || {
+        while let Ok(line) = rx.recv() {
+            let _ = writeln!(f, "{line}");
+            // 把已排队的行一起写完再 flush
+            while let Ok(l) = rx.try_recv() {
+                let _ = writeln!(f, "{l}");
+            }
+            let _ = f.flush();
+            if f.get_ref().metadata().map(|m| m.len() > LOG_MAX).unwrap_or(false) {
+                let _ = std::fs::rename(&path, format!("{path}.1"));
+                if let Ok(nf) = open(&path) {
+                    f = std::io::BufWriter::new(nf);
+                }
+            }
+        }
+    })?;
+    Ok(tx)
+}
 
 const MAIN_HELP: &str = "ssfp —— 出口 TCP 指纹跟随设备系统的 Shadowsocks 2022 服务端
 用法：
@@ -344,9 +411,7 @@ async fn serve(path: String) -> anyhow::Result<()> {
     let admin_token = admin_token(&dir)?;
 
     let log = match &cfg.log {
-        Some(p) => Some(std::sync::Mutex::new(
-            std::fs::OpenOptions::new().create(true).append(true).open(p).with_context(|| format!("打开日志 {p}"))?,
-        )),
+        Some(p) => Some(spawn_log_writer(p.clone())?),
         None => None,
     };
 
@@ -382,9 +447,10 @@ async fn serve(path: String) -> anyhow::Result<()> {
     };
     let public_host = cfg.public_host.clone().unwrap_or_else(default_public_host);
     let st = Arc::new(State {
-        ebpf_iface: rewriter.as_ref().and(cfg.syn_rewrite_iface.clone()),
-        ebpf_error,
+        ebpf_iface: std::sync::Mutex::new(rewriter.as_ref().and(cfg.syn_rewrite_iface.clone())),
+        ebpf_error: std::sync::Mutex::new(ebpf_error),
         ebpf: std::sync::Mutex::new(rewriter),
+        dns: net::Resolver::new(&cfg),
         cfg,
         method,
         svr: svr.clone(),
@@ -424,11 +490,17 @@ async fn serve(path: String) -> anyhow::Result<()> {
                 tick += 1;
                 st2.traffic.sample();
                 if tick % 12 == 0 {
-                    st2.traffic.roll();
-                    st2.store.flush();
+                    // 落盘放到阻塞线程池，不占转发线程
+                    let st3 = st2.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        st3.traffic.roll();
+                        st3.store.flush();
+                    })
+                    .await;
                     let delta = st2.ebpf.lock().unwrap().as_mut().and_then(|r| r.stats_delta());
                     if let Some(v) = delta {
                         st2.write_value(&v);
+                        st2.check_ebpf_health(&v["ebpf_stats"]);
                     }
                 }
             }
@@ -441,6 +513,7 @@ async fn serve(path: String) -> anyhow::Result<()> {
             r = listener.accept() => match r {
                 Ok((tcp, peer)) => {
                     let _ = tcp.set_nodelay(true);
+                    let _ = net::set_keepalive(socket2::SockRef::from(&tcp), st.cfg.tcp_keepalive_s);
                     let snap = st.store.snapshot();
                     let stream = ProxyServerStream::from_stream_with_user_manager(
                         context.clone(), tcp, st.method, st.svr.key(), snap.users.clone());

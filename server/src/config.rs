@@ -77,6 +77,21 @@ struct RawConfig {
     set_mark: bool,
     #[serde(default = "d_connect")]
     connect_timeout_s: u64,
+    /// 入站和出站 TCP keepalive：空闲这么多秒后开始探测（间隔同值的 1/3，3 次无响应断开）；0 = 关
+    #[serde(default = "d_keepalive")]
+    tcp_keepalive_s: u64,
+    /// TCP 转发双向都没有数据超过这么多秒就关闭；0 = 不限
+    #[serde(default = "d_tcp_idle")]
+    tcp_idle_s: u64,
+    /// 单次域名解析超时
+    #[serde(default = "d_dns_timeout")]
+    dns_timeout_s: u64,
+    /// 域名解析结果缓存秒数（失败结果缓存 5 秒）；0 = 不缓存
+    #[serde(default = "d_dns_cache")]
+    dns_cache_s: u64,
+    /// 拨号时 IPv4 优先（Happy Eyeballs 仍会在 250ms 后尝试另一族）
+    #[serde(default)]
+    prefer_ipv4: bool,
     #[serde(default)]
     log: Option<String>,
     /// 在这个网卡的 egress 挂 eBPF 改写 SYN；"auto"（默认）= 默认路由的网卡，"off" = 不挂
@@ -131,6 +146,18 @@ fn d_auto() -> String {
 fn d_connect() -> u64 {
     10
 }
+fn d_keepalive() -> u64 {
+    30
+}
+fn d_tcp_idle() -> u64 {
+    600
+}
+fn d_dns_timeout() -> u64 {
+    5
+}
+fn d_dns_cache() -> u64 {
+    60
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -145,6 +172,11 @@ pub struct Config {
     pub block_private: bool,
     pub set_mark: bool,
     pub connect_timeout_s: u64,
+    pub tcp_keepalive_s: u64,
+    pub tcp_idle_s: u64,
+    pub dns_timeout_s: u64,
+    pub dns_cache_s: u64,
+    pub prefer_ipv4: bool,
     pub log: Option<String>,
     pub ja4: HashMap<String, Family>,
     pub syn_rewrite_iface: Option<String>,
@@ -188,7 +220,12 @@ impl Config {
             set_mark: r.set_mark || iface.is_some(),
             syn_rewrite_l3_offset: r.syn_rewrite_l3_offset.unwrap_or_else(|| iface.as_deref().map(l3_offset_of).unwrap_or(14)),
             syn_rewrite_iface: iface,
-            connect_timeout_s: r.connect_timeout_s,
+            connect_timeout_s: r.connect_timeout_s.clamp(1, 60),
+            tcp_keepalive_s: r.tcp_keepalive_s,
+            tcp_idle_s: r.tcp_idle_s,
+            dns_timeout_s: r.dns_timeout_s.clamp(1, 30),
+            dns_cache_s: r.dns_cache_s,
+            prefer_ipv4: r.prefer_ipv4,
             log: r.log,
             udp: r.udp,
             block_quic: r.block_quic,

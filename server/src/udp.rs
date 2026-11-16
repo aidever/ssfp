@@ -60,7 +60,6 @@ struct Assoc {
     user: Option<Arc<ServerUser>>,
     last_seen: Mutex<Instant>,
     log: Mutex<AssocLog>,
-    dns: Mutex<HashMap<String, SocketAddr>>,
     dev_stats: Arc<DevStats>,
     bytes: Arc<ConnBytes>,
     conn_id: u64,
@@ -112,24 +111,13 @@ fn out_socket(v6: bool, tpl: &Template, st: &State) -> anyhow::Result<UdpSocket>
 }
 
 impl Assoc {
-    async fn resolve(&self, addr: &Address) -> Option<SocketAddr> {
-        match addr {
-            Address::SocketAddress(a) => Some(*a),
-            Address::DomainNameAddress(h, p) => {
-                let k = format!("{h}:{p}");
-                if let Some(a) = self.dns.lock().unwrap().get(&k) {
-                    return Some(*a);
-                }
-                let a = tokio::net::lookup_host((h.as_str(), *p)).await.ok()?.find(|a| {
-                    (a.is_ipv4() && self.v4.is_some()) || (a.is_ipv6() && self.v6.is_some())
-                })?;
-                let mut d = self.dns.lock().unwrap();
-                if d.len() < 256 {
-                    d.insert(k, a);
-                }
-                Some(a)
-            }
+    /// 从解析结果里挑一个有出口 socket 的地址（prefer_ipv4 时先挑 IPv4）
+    fn pick(&self, addrs: &[SocketAddr], prefer_ipv4: bool) -> Option<SocketAddr> {
+        let usable = |a: &&SocketAddr| (a.is_ipv4() && self.v4.is_some()) || (a.is_ipv6() && self.v6.is_some());
+        if prefer_ipv4 && let Some(a) = addrs.iter().filter(usable).find(|a| a.is_ipv4()) {
+            return Some(*a);
         }
+        addrs.iter().find(usable).copied()
     }
 
     fn ctrl(&self) -> UdpSocketControlData {
@@ -149,7 +137,11 @@ async fn downlink(a: Arc<Assoc>, sock: Arc<UdpSocket>, proxy: Proxy, idle: Durat
         let r = tokio::time::timeout(idle, sock.recv_from(&mut buf)).await;
         let (n, from) = match r {
             Ok(Ok(x)) => x,
-            Ok(Err(_)) => continue,
+            Ok(Err(_)) => {
+                // 一般不会持续出错；万一出错别空转
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
             Err(_) => {
                 if a.last_seen.lock().unwrap().elapsed() >= idle {
                     return;
@@ -236,34 +228,57 @@ pub async fn serve(st: Arc<State>, ctx: SharedContext) -> anyhow::Result<()> {
         *a.peer.lock().unwrap() = peer;
         *a.last_seen.lock().unwrap() = Instant::now();
 
-        let Some(dst) = a.resolve(&target).await else {
-            a.log.lock().unwrap().dropped_other += 1;
-            continue;
-        };
-        if st.cfg.block_quic && dst.port() == 443 {
+        // QUIC 按端口直接丢，不必解析
+        if st.cfg.block_quic && target.port() == 443 {
             a.log.lock().unwrap().dropped_quic += 1;
             continue;
         }
-        let dev = ctrl.user.as_ref().and_then(|u| st.store.snapshot().by_key.get(u.key()).cloned());
-        if !st.target_allowed(&dst, dev.as_ref()) {
-            a.log.lock().unwrap().dropped_other += 1;
-            continue;
-        }
-        let out = if dst.is_ipv4() { a.v4.as_ref() } else { a.v6.as_ref() };
-        let Some(out) = out else {
-            a.log.lock().unwrap().dropped_other += 1;
-            continue;
+        // IP 目标或缓存命中：就地发送；否则交给单独的任务解析，主循环不等 DNS
+        let resolved = match &target {
+            Address::SocketAddress(x) => Some(Ok(vec![*x])),
+            Address::DomainNameAddress(h, p) => st.dns.cached(h, *p),
         };
-        if out.send_to(&buf[..n], dst).await.is_ok() {
-            a.count(true, n);
-            let mut l = a.log.lock().unwrap();
-            if l.first_target.is_none() {
-                l.first_target = Some(target.to_string());
-                st.traffic.update_conn(a.conn_id(), |c| c.target = format!("UDP {target}"));
+        match resolved {
+            Some(r) => forward(&st, &a, r.ok(), &target, &buf[..n]).await,
+            None => {
+                let (st, a, data) = (st.clone(), a.clone(), buf[..n].to_vec());
+                tokio::spawn(async move {
+                    let r = match &target {
+                        Address::DomainNameAddress(h, p) => st.dns.resolve(h, *p).await.ok(),
+                        Address::SocketAddress(x) => Some(vec![*x]),
+                    };
+                    forward(&st, &a, r, &target, &data).await;
+                });
             }
-            l.pkts_up += 1;
-            l.bytes_up += n as u64;
         }
+    }
+}
+
+/// 解析后的上行转发：检查目标、选出口、发送、计数
+async fn forward(st: &State, a: &Assoc, addrs: Option<Vec<SocketAddr>>, target: &Address, data: &[u8]) {
+    let Some(dst) = addrs.and_then(|v| a.pick(&v, st.cfg.prefer_ipv4)) else {
+        a.log.lock().unwrap().dropped_other += 1;
+        return;
+    };
+    let dev = a.user.as_ref().and_then(|u| st.store.snapshot().by_key.get(u.key()).cloned());
+    if !st.target_allowed(&dst, dev.as_ref()) {
+        a.log.lock().unwrap().dropped_other += 1;
+        return;
+    }
+    let out = if dst.is_ipv4() { a.v4.as_ref() } else { a.v6.as_ref() };
+    let Some(out) = out else {
+        a.log.lock().unwrap().dropped_other += 1;
+        return;
+    };
+    if out.send_to(data, dst).await.is_ok() {
+        a.count(true, data.len());
+        let mut l = a.log.lock().unwrap();
+        if l.first_target.is_none() {
+            l.first_target = Some(target.to_string());
+            st.traffic.update_conn(a.conn_id(), |c| c.target = format!("UDP {target}"));
+        }
+        l.pkts_up += 1;
+        l.bytes_up += data.len() as u64;
     }
 }
 
@@ -331,7 +346,6 @@ fn new_assoc(
             template_source: Some(source),
             ..Default::default()
         }),
-        dns: Mutex::new(HashMap::new()),
     });
     assocs.lock().unwrap().insert((peer, ctrl.client_session_id), a.clone());
 
