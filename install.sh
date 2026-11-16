@@ -29,6 +29,7 @@ BIN=/usr/local/bin/ssfp
 CONF=/etc/ssfp/config.toml
 UNIT=/etc/systemd/system/ssfp.service
 SYSCTL=/etc/sysctl.d/99-ssfp.conf
+MODLOAD=/etc/modules-load.d/ssfp.conf
 
 say() { printf '==> %s\n' "$*"; }
 warn() { printf 'WARN %s\n' "$*" >&2; }
@@ -56,7 +57,7 @@ command -v systemctl >/dev/null && [ -d /run/systemd/system ] || die "需要以 
 if [ "$UNINSTALL" = 1 ]; then
   say "卸载 ssfp"
   systemctl disable --now ssfp 2>/dev/null || true
-  rm -f "$UNIT" "$UNIT.bak" "$BIN" "$BIN.bak" "$SYSCTL"
+  rm -f "$UNIT" "$UNIT.bak" "$BIN" "$BIN.bak" "$SYSCTL" "$MODLOAD"
   systemctl daemon-reload || true
   if [ "$PURGE" = 1 ]; then
     rm -rf /etc/ssfp /var/lib/ssfp /var/log/ssfp
@@ -118,6 +119,9 @@ fi
 install -m 644 "$SRC/ssfp.service" "$UNIT"
 install -m 644 "$SRC/99-ssfp.conf" "$SYSCTL"
 sysctl -q -p "$SYSCTL" || warn "sysctl 设置失败（容器里常见）：Windows / Android 模板的 wscale 会偏小"
+# 客户端一侧连接用 BBR（client_congestion），开机加载模块
+echo tcp_bbr > "$MODLOAD"
+modprobe tcp_bbr 2>/dev/null || warn "加载 tcp_bbr 失败：客户端一侧连接会退回内核默认拥塞控制"
 install -d -m 700 /etc/ssfp
 install -m 644 "$SRC/config.example.toml" /etc/ssfp/config.example.toml
 

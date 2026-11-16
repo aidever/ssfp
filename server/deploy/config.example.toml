@@ -27,6 +27,7 @@ connect_timeout_s = 10       # 整个拨号的上限；多个地址按 Happy Eye
 tcp_keepalive_s = 30         # 入站、出站 keepalive：空闲 30 秒开始探测，约 1 分钟发现对端消失；0 = 关
 tcp_idle_s = 600             # TCP 双向都没有数据超过 600 秒就关闭；0 = 不限
 dns_timeout_s = 5
+client_congestion = "bbr"    # 客户端一侧连接的拥塞控制（跨洋、有丢包时比 cubic 快得多）；出站连接不变，不影响指纹；"" = 不改
 dns_cache_s = 60             # 解析结果缓存；解析器故障时继续用旧结果（最多 1 小时）；0 = 不缓存
 log = "/var/log/ssfp/conn.jsonl"
 

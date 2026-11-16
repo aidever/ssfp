@@ -1,6 +1,6 @@
 [package]
 name = "ssfp"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 description = "出口 TCP 指纹跟随设备系统的 Shadowsocks 2022 服务端"
 license = "MIT"

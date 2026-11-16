@@ -508,12 +508,22 @@ async fn serve(path: String) -> anyhow::Result<()> {
     }
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut cc_warned = false;
     loop {
         tokio::select! {
             r = listener.accept() => match r {
                 Ok((tcp, peer)) => {
                     let _ = tcp.set_nodelay(true);
                     let _ = net::set_keepalive(socket2::SockRef::from(&tcp), st.cfg.tcp_keepalive_s);
+                    if let Some(cc) = &st.cfg.client_congestion {
+                        // 只改入站（客户端 ↔ 本机）这一段；失败时只提示一次，退回内核默认
+                        if let Err(e) = socket2::SockRef::from(&tcp).set_tcp_congestion(cc.as_bytes())
+                            && !cc_warned
+                        {
+                            cc_warned = true;
+                            eprintln!("警告：入站连接设置拥塞控制 {cc} 失败（{e}），使用内核默认。可 modprobe tcp_bbr");
+                        }
+                    }
                     let snap = st.store.snapshot();
                     let stream = ProxyServerStream::from_stream_with_user_manager(
                         context.clone(), tcp, st.method, st.svr.key(), snap.users.clone());

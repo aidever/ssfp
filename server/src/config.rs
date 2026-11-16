@@ -92,6 +92,9 @@ struct RawConfig {
     /// 拨号时 IPv4 优先（Happy Eyeballs 仍会在 250ms 后尝试另一族）
     #[serde(default)]
     prefer_ipv4: bool,
+    /// 客户端一侧（入站）连接的拥塞控制，如 "bbr"；出站连接保持内核默认，不影响出口指纹。"" = 不改
+    #[serde(default = "d_cc")]
+    client_congestion: String,
     #[serde(default)]
     log: Option<String>,
     /// 在这个网卡的 egress 挂 eBPF 改写 SYN；"auto"（默认）= 默认路由的网卡，"off" = 不挂
@@ -158,6 +161,9 @@ fn d_dns_timeout() -> u64 {
 fn d_dns_cache() -> u64 {
     60
 }
+fn d_cc() -> String {
+    "bbr".into()
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -177,6 +183,7 @@ pub struct Config {
     pub dns_timeout_s: u64,
     pub dns_cache_s: u64,
     pub prefer_ipv4: bool,
+    pub client_congestion: Option<String>,
     pub log: Option<String>,
     pub ja4: HashMap<String, Family>,
     pub syn_rewrite_iface: Option<String>,
@@ -226,6 +233,10 @@ impl Config {
             dns_timeout_s: r.dns_timeout_s.clamp(1, 30),
             dns_cache_s: r.dns_cache_s,
             prefer_ipv4: r.prefer_ipv4,
+            client_congestion: match r.client_congestion.trim() {
+                "" | "off" | "none" => None,
+                c => Some(c.to_string()),
+            },
             log: r.log,
             udp: r.udp,
             block_quic: r.block_quic,
