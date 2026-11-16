@@ -177,18 +177,35 @@ async fn race(order: &[SocketAddr], tpl: &Template, cfg: &Config) -> anyhow::Res
     }
 }
 
-/// 主机名 → (解析结果, 过期时间)
-type DnsCache = std::collections::HashMap<String, (Result<Vec<IpAddr>, String>, std::time::Instant)>;
+struct DnsEntry {
+    r: Result<Vec<IpAddr>, String>,
+    /// 在此之前直接用缓存
+    fresh_until: std::time::Instant,
+    /// 在此之前，重新解析失败时仍可用这份旧结果（serve-stale，RFC 8767）
+    keep_until: std::time::Instant,
+}
 
-/// 带超时和缓存的域名解析（TCP 与 UDP 共用）
+/// 带超时和缓存的域名解析（TCP 与 UDP 共用）。
+/// 解析器临时故障（超时、EAI_AGAIN）时继续用过期结果，并且不缓存这类失败；
+/// 只有"域名不存在 / 没有地址"这类确定的失败缓存 5 秒。
 pub struct Resolver {
-    cache: std::sync::Mutex<DnsCache>,
+    cache: std::sync::Mutex<std::collections::HashMap<String, DnsEntry>>,
     timeout: Duration,
     ttl: Duration,
 }
 
 const DNS_NEG_TTL: Duration = Duration::from_secs(5);
+const DNS_STALE_MAX: Duration = Duration::from_secs(3600);
 const DNS_CACHE_MAX: usize = 4096;
+
+fn to_addrs(ips: &[IpAddr], port: u16) -> Vec<SocketAddr> {
+    ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect()
+}
+
+/// 解析器自身的临时故障（换个时间再试可能成功），区别于域名确实不存在
+fn transient(e: &str) -> bool {
+    e.contains("Try again") || e.contains("Temporary failure") || e.starts_with("超时")
+}
 
 impl Resolver {
     pub fn new(cfg: &Config) -> Self {
@@ -199,16 +216,13 @@ impl Resolver {
         }
     }
 
-    /// 只查缓存（未命中或已过期返回 None）
+    /// 只查新鲜的缓存（未命中或已过期返回 None）
     pub fn cached(&self, host: &str, port: u16) -> Option<anyhow::Result<Vec<SocketAddr>>> {
         let key = host.trim_end_matches('.').to_ascii_lowercase();
         let m = self.cache.lock().unwrap();
-        let (r, exp) = m.get(&key)?;
-        if *exp <= std::time::Instant::now() {
-            return None;
-        }
-        Some(match r {
-            Ok(ips) => Ok(ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect()),
+        let e = m.get(&key).filter(|e| e.fresh_until > std::time::Instant::now())?;
+        Some(match &e.r {
+            Ok(ips) => Ok(to_addrs(ips, port)),
             Err(e) => Err(anyhow::anyhow!("域名解析失败: {e}")),
         })
     }
@@ -232,21 +246,35 @@ impl Resolver {
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err(format!("超时（{} 秒）", self.timeout.as_secs())),
         };
-        let ttl = if r.is_ok() { self.ttl } else { DNS_NEG_TTL };
-        if !ttl.is_zero() {
-            let now = std::time::Instant::now();
-            let mut m = self.cache.lock().unwrap();
-            if m.len() >= DNS_CACHE_MAX {
-                m.retain(|_, (_, exp)| *exp > now);
-                if m.len() >= DNS_CACHE_MAX {
-                    m.clear();
-                }
-            }
-            m.insert(key, (r.clone(), now + ttl));
+        if self.ttl.is_zero() {
+            return r.map(|ips| to_addrs(&ips, port)).map_err(|e| anyhow::anyhow!("域名解析失败: {e}"));
         }
+        let now = std::time::Instant::now();
+        let mut m = self.cache.lock().unwrap();
         match r {
-            Ok(ips) => Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()),
-            Err(e) => Err(anyhow::anyhow!("域名解析失败: {e}")),
+            Ok(ips) => {
+                let out = to_addrs(&ips, port);
+                if m.len() >= DNS_CACHE_MAX {
+                    m.retain(|_, e| e.keep_until > now);
+                    if m.len() >= DNS_CACHE_MAX {
+                        m.clear();
+                    }
+                }
+                m.insert(key, DnsEntry { r: Ok(ips), fresh_until: now + self.ttl, keep_until: now + DNS_STALE_MAX });
+                Ok(out)
+            }
+            Err(err) => {
+                // 解析失败：还留着旧结果就先用旧的
+                if let Some(DnsEntry { r: Ok(ips), keep_until, .. }) = m.get(&key)
+                    && *keep_until > now
+                {
+                    return Ok(to_addrs(ips, port));
+                }
+                if !transient(&err) {
+                    m.insert(key, DnsEntry { r: Err(err.clone()), fresh_until: now + DNS_NEG_TTL, keep_until: now + DNS_NEG_TTL });
+                }
+                Err(anyhow::anyhow!("域名解析失败: {err}"))
+            }
         }
     }
 }
@@ -296,5 +324,13 @@ mod tests {
         assert_eq!(interleave(&t, false), vec![t[0], t[2], t[1], t[3]]);
         assert_eq!(interleave(&t, true), vec![t[2], t[0], t[3], t[1]]);
         assert_eq!(interleave(&t[2..], false), vec![t[2], t[3]]);
+    }
+
+    #[test]
+    fn transient_dns_errors() {
+        assert!(transient("failed to lookup address information: Try again"));
+        assert!(transient("failed to lookup address information: Temporary failure in name resolution"));
+        assert!(transient("超时（5 秒）"));
+        assert!(!transient("failed to lookup address information: Name does not resolve"));
     }
 }

@@ -27,7 +27,7 @@ connect_timeout_s = 10       # 整个拨号的上限；多个地址按 Happy Eye
 tcp_keepalive_s = 30         # 入站、出站 keepalive：空闲 30 秒开始探测，约 1 分钟发现对端消失；0 = 关
 tcp_idle_s = 600             # TCP 双向都没有数据超过 600 秒就关闭；0 = 不限
 dns_timeout_s = 5
-dns_cache_s = 60             # 解析结果缓存（失败缓存 5 秒）；0 = 不缓存
+dns_cache_s = 60             # 解析结果缓存；解析器故障时继续用旧结果（最多 1 小时）；0 = 不缓存
 log = "/var/log/ssfp/conn.jsonl"
 
 # 看板 + 订阅：默认只听本机，用 SSH 端口转发打开（ssh -L 43480:127.0.0.1:43480 服务器）。
