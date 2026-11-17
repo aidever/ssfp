@@ -274,7 +274,7 @@ async fn relay(
     }
 
     // 8. 双向转发；双向都没有数据超过 tcp_idle_s 时关闭（keepalive 只能发现对端消失，发现不了"活着但不再用"）
-    let r = relay_with_idle(stream, &mut out, &bytes, st.cfg.tcp_idle_s).await;
+    let r = relay_with_idle(st.method, stream, &mut out, &bytes, st.cfg.tcp_idle_s).await;
     log.bytes_up = bytes.up.load(Relaxed);
     log.bytes_down = bytes.down.load(Relaxed);
     if let Err(e) = r {
@@ -283,13 +283,21 @@ async fn relay(
     Ok(())
 }
 
-async fn relay_with_idle(
+/// 双向转发；双向都没有数据超过 idle_s 秒时关闭。
+///
+/// 必须用 shadowsocks 自带的 copy_encrypted_bidirectional，不能用 tokio::io::copy_bidirectional：
+/// SS 加密流的 poll_write 遇到 Pending 后，下次调用会把上次已加密好的数据写完，却返回本次 buf 的长度。
+/// tokio 的 copy 在写 Pending 期间会继续往缓冲里读新数据，下次传入更长的 buf，多出来的部分被当作
+/// "已写出"而丢掉，客户端收到的数据流就坏了（TLS 校验失败，同一连接上后续的请求全部失败）。
+/// 只在写给客户端发生反压时出现，也就是经中转、跨洋这类慢线路上。
+async fn relay_with_idle<B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    method: CipherKind,
     a: &mut ProxyServerStream<TcpStream>,
-    b: &mut Counted<TcpStream>,
+    b: &mut B,
     bytes: &traffic::ConnBytes,
     idle_s: u64,
 ) -> std::io::Result<(u64, u64)> {
-    let copy = tokio::io::copy_bidirectional_with_sizes(a, b, RELAY_BUF, RELAY_BUF);
+    let copy = shadowsocks::relay::tcprelay::utils::copy_encrypted_bidirectional(method, a, b);
     if idle_s == 0 {
         return copy.await;
     }
@@ -313,9 +321,6 @@ async fn relay_with_idle(
         }
     }
 }
-
-/// 转发缓冲（每个方向）
-const RELAY_BUF: usize = 32 * 1024;
 
 fn default_public_host() -> String {
     // 取默认路由出口的 IPv4（不发包）
@@ -543,5 +548,88 @@ async fn serve(path: String) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shadowsocks::ProxyClientStream;
+
+    /// 客户端读得慢（中转 / 跨洋线路的常态）时，写给客户端的数据会反压（poll_write 返回 Pending）。
+    /// 回传的数据必须一个字节不丢、不乱序地到达客户端。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_is_lossless_under_backpressure() {
+        const TOTAL: usize = 3 << 20;
+        let pattern: Vec<u8> = (0..TOTAL).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+
+        let method = CipherKind::AEAD2022_BLAKE3_AES_128_GCM;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let svr = ServerConfig::new(addr, "AAAAAAAAAAAAAAAAAAAAAA==", method).unwrap();
+
+        // 服务端：握手后把 SS 流和"目标网站"（内存管道）对接
+        // 管道容量取一个包的大小：真实网站的数据也是一次几 KB 地到达，copy 的缓冲很少一次读满
+        let (mut plain, mut site) = tokio::io::duplex(1500);
+        let key = svr.key().to_vec();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            // 发送缓冲调小，让反压尽早出现
+            let _ = socket2::SockRef::from(&tcp).set_send_buffer_size(8 * 1024);
+            let ctx = Context::new_shared(shadowsocks::config::ServerType::Server);
+            let mut s = ProxyServerStream::from_stream(ctx, tcp, method, &key);
+            s.handshake().await.unwrap();
+            let bytes = traffic::ConnBytes::default();
+            let _ = relay_with_idle(method, &mut s, &mut plain, &bytes, 0).await;
+        });
+        // 目标网站：读走请求，然后不规则大小地连续写回响应
+        let src = pattern.clone();
+        tokio::spawn(async move {
+            let mut req = [0u8; 16];
+            let _ = site.read(&mut req).await;
+            let mut i = 0;
+            let mut step = 1000;
+            while i < src.len() {
+                let n = step.min(src.len() - i);
+                site.write_all(&src[i..i + n]).await.unwrap();
+                i += n;
+                step = 700 + (step * 7919) % 9000;
+            }
+            site.shutdown().await.unwrap();
+        });
+
+        // 客户端：读得慢
+        let ctx = Context::new_shared(shadowsocks::config::ServerType::Local);
+        // 接收缓冲调小（必须在 connect 前设置），否则回环上内核会把整段数据都收进缓冲，反压不会发生
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.set_recv_buffer_size(8 * 1024).unwrap();
+        let tcp = sock.connect(addr).await.unwrap();
+        let mut c = ProxyClientStream::from_stream(ctx, tcp, &svr, Address::DomainNameAddress("example.com".into(), 443));
+        c.write_all(b"GET").await.unwrap();
+        let mut got = Vec::with_capacity(TOTAL);
+        let mut buf = vec![0u8; 4096];
+        let read = async {
+            loop {
+                match c.read(&mut buf).await {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) => break Err(e),
+                }
+                if got.len() % (32 * 1024) < 4096 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        };
+        let r = tokio::time::timeout(Duration::from_secs(60), read).await.expect("超时");
+        server.abort();
+        let first_diff = got.iter().zip(&pattern).position(|(a, b)| a != b);
+        assert!(
+            r.is_ok() && got.len() == TOTAL && first_diff.is_none(),
+            "回传数据损坏：读取结果 {:?}，收到 {} / {} 字节，首个不同字节位于 {:?}",
+            r.err(),
+            got.len(),
+            TOTAL,
+            first_diff
+        );
     }
 }
